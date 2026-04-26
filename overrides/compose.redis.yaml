@@ -1,7 +1,7 @@
 services:
 
   redis-cache:
-    image: redis:7-alpine
+    image: redis:8.6-alpine
     restart: unless-stopped
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
     volumes:
@@ -14,7 +14,7 @@ services:
       retries: 3
 
   redis-queue:
-    image: redis:7-alpine
+    image: redis:8.6-alpine
     restart: unless-stopped
     command: redis-server --save "" --appendonly no
     volumes:
