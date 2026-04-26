@@ -7,16 +7,19 @@ services:
       - traefik.enable=true
       # Use the traefik-public network (declared below)
       - traefik.docker.network=traefik-public
+      # Reusable HTTP -> HTTPS redirect middleware for application routers.
+      - traefik.http.middlewares.https-redirect.redirectscheme.scheme=https
+      - traefik.http.middlewares.https-redirect.redirectscheme.permanent=true
       # admin-auth middleware with HTTP Basic auth
       # Using the environment variables USERNAME and HASHED_PASSWORD
-      - traefik.http.middlewares.admin-auth.basicauth.users=admin:${HASHED_PASSWORD:?No HASHED_PASSWORD set}
+ #     - traefik.http.middlewares.admin-auth.basicauth.users=admin:${HASHED_PASSWORD:?No HASHED_PASSWORD set}
       # Uses the environment variable TRAEFIK_DOMAIN
-      - traefik.http.routers.traefik-public-http.rule=Host(`${TRAEFIK_DOMAIN:?No TRAEFIK_DOMAIN set}`)
+#      - traefik.http.routers.traefik-public-http.rule=Host(`${TRAEFIK_DOMAIN:?No TRAEFIK_DOMAIN set}`)
       - traefik.http.routers.traefik-public-http.entrypoints=http
       # Use the special Traefik service api@internal with the web UI/Dashboard
       - traefik.http.routers.traefik-public-http.service=api@internal
       # Enable HTTP Basic auth, using the middleware created above
-      - traefik.http.routers.traefik-public-http.middlewares=admin-auth
+#      - traefik.http.routers.traefik-public-http.middlewares=admin-auth
       # Define the port inside of the Docker service to use
       - traefik.http.services.traefik-public.loadbalancer.server.port=8080
     command:
@@ -26,20 +29,33 @@ services:
       - --providers.docker.exposedbydefault=false
       # Create an entrypoint http listening on port 80
       - --entrypoints.http.address=:80
+      # Create an entrypoint https listening on port 443
+      - --entrypoints.https.address=:443
+      # Let's Encrypt resolver used by app routers on the shared network.
+      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:?No Let's Encrypt email set}
+      - --certificatesresolvers.le.acme.storage=/certificates/acme.json
+      - --certificatesresolvers.le.acme.tlschallenge=true
       # Enable the access log, with HTTP requests
       - --accesslog
       # Enable the Traefik log, for configurations and errors
       - --log
       # Enable the Dashboard and API
-      - --api
+      - --api.insecure=true
+      - --api.dashboard=true
     ports:
       - ${HTTP_PUBLISH_PORT:-80}:80
+      - ${HTTPS_PUBLISH_PORT:-443}:443
+      - "8181:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - cert-data:/certificates
     networks:
       - traefik-public
+
+volumes:
+  cert-data:
 
 networks:
   traefik-public:
     name: traefik-public
-    external: false
+    external: true

@@ -1,39 +1,78 @@
+# Override para despliegue multi-bench con Traefik y MariaDB compartida.
+#
+# Uso:
+#   docker compose \
+#     --env-file chamigo.env \
+#     -f compose.yaml \
+#     -f overrides/compose.mariadb-shared.yaml \
+#     -f overrides/compose.multi-bench.yaml \
+#     up -d
+#
+# Redes externas requeridas (crear una sola vez):
+#   docker network create traefik-public
+#   docker network create mariadb-network
+
 services:
-  frontend:
-    networks:
-      - traefik-public
-      - bench-network
-    labels:
-      - traefik.enable=true
-      - traefik.docker.network=traefik-public
-      - traefik.http.services.${ROUTER?ROUTER not set}.loadbalancer.server.port=8080
-      - traefik.http.routers.${ROUTER}-http.service=${ROUTER}
-      - traefik.http.routers.${ROUTER}-http.entrypoints=http
-      - traefik.http.routers.${ROUTER}-http.rule=${SITES_RULE?SITES_RULE not set}
+
+  # ── CONFIGURATOR 
   configurator:
     networks:
       - bench-network
-      - mariadb-network
+      - mariadb-network   
+
+  # ── BACKEND 
   backend:
     networks:
-      - mariadb-network
       - bench-network
+      - mariadb-network
+
+  # ── FRONTEND (nginx) — expuesto vía Traefik 
+  frontend:
+    ports: !reset []        # elimina cualquier port binding directo
+    networks:
+      - bench-network
+      - traefik-public
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=traefik-public
+      # Servicio
+      - traefik.http.services.${ROUTER}.loadbalancer.server.port=8080
+      # Ruta HTTP
+      - traefik.http.routers.${ROUTER}-http.service=${ROUTER}
+      - traefik.http.routers.${ROUTER}-http.entrypoints=http
+      - traefik.http.routers.${ROUTER}-http.rule=${SITES_RULE}
+      - traefik.http.routers.${ROUTER}-http.middlewares=https-redirect
+      # Ruta HTTPS
+      - traefik.http.routers.${ROUTER}-https.service=${ROUTER}
+      - traefik.http.routers.${ROUTER}-https.entrypoints=https
+      - traefik.http.routers.${ROUTER}-https.rule=${SITES_RULE}
+      - traefik.http.routers.${ROUTER}-https.tls=true
+      - traefik.http.routers.${ROUTER}-https.tls.certresolver=le
+
+  # ── WEBSOCKET 
   websocket:
     networks:
       - bench-network
       - mariadb-network
-  scheduler:
-    networks:
-      - bench-network
-      - mariadb-network
+
+  # ── WORKERS 
   queue-short:
     networks:
       - bench-network
       - mariadb-network
+
   queue-long:
     networks:
       - bench-network
       - mariadb-network
+
+  # ── SCHEDULER 
+  scheduler:
+    networks:
+      - bench-network
+      - mariadb-network
+
+  # ── REDIS 
   redis-cache:
     networks:
       - bench-network
@@ -43,10 +82,16 @@ services:
       - bench-network
 
 networks:
-  traefik-public:
-    external: true
-  mariadb-network:
-    external: true
+  # Red interna del bench 
   bench-network:
-    name: ${ROUTER}
-    external: false
+    name: ${ROUTER}-bench
+    driver: bridge
+
+  # Redes externas compartidas entre stacks
+  traefik-public:
+    name: traefik-public
+    external: true
+
+  mariadb-network:
+    name: mariadb-network
+    external: true

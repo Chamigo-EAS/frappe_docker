@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# =============================================================================
+# scripts/setup-accounting-py.sh
+# Configura la contabilidad base ERPNext
+#
+# SISTEMA TRIBUTARIO PARAGUAY (SET / DNIT):
+#   Moneda:     PYG 
+#   IVA 10%:    Tasa general — bienes y servicios
+#   IVA 5%:     Tasa reducida — arrendamiento de vivienda, productos básicos
+#   IVA 0%:     Exento / Exportaciones
+#   IRE 10%:    Impuesto a la Renta Empresarial
+#   IRP 10%:    Impuesto a la Renta Personal
+#   IRACIS:     Para empresas bajo régimen especial
+#   ID fiscal:  RUC (Registro Único de Contribuyentes)
+#   FE System:  SIFEN — Documentos XML firmados : SET en 72 horas
+#   Documentos: Factura Electrónica, Nota de Crédito/Débito,
+#               Autofactura, Nota de Remisión, Recibo Electrónico
+#   KuDE:       Representación impresa del DTE
+#
+# USO:
+#   ./scripts/setup-accounting-py.sh <bench-env> <site> "<empresa>" <ruc>
+#
+# EJEMPLO:
+#   ./scripts/setup-accounting-py.sh eval eval.localhost "Mi Empresa S.A." 80012345-6
+# =============================================================================
+set -euo pipefail
+
+BENCH_ENV="${1:?Falta bench-env (ej: eval)}"
+SITE="${2:?Falta site (ej: eval.localhost)}"
+EMPRESA="${3:?Falta nombre de empresa}"
+RUC="${4:?Falta RUC (ej: 80012345-6)}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(dirname "$SCRIPT_DIR")"
+GITOPS_DIR="$BASE_DIR/gitops"
+
+GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${BLUE}[PY]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+
+COMPOSE_CMD="docker compose \
+    --project-name ${BENCH_ENV} \
+    --env-file ${GITOPS_DIR}/${BENCH_ENV}.env \
+    -f ${BASE_DIR}/compose.yaml \
+    -f ${BASE_DIR}/overrides/compose.redis.yaml \
+    -f ${BASE_DIR}/overrides/compose.multi-bench.yaml"
+
+log "Iniciando configuración contable Paraguay para '${EMPRESA}' (RUC: ${RUC})"
+
+# ── Ejecutar script Python completo en el container ───────────────────────────
+eval "${COMPOSE_CMD} exec -T backend python3" << PYEOF
+import frappe
+frappe.connect(site="${SITE}")
+frappe.set_user("Administrator")
+
+EMPRESA = "${EMPRESA}"
+RUC     = "${RUC}"
+
+print(f"\\n{'='*60}")
+print(f"  Configuración contable PARAGUAY")
+print(f"  Empresa: {EMPRESA}")
+print(f"  RUC:     {RUC}")
+print(f"  Norma:   SET/DNIT — SIFEN")
+print(f"{'='*60}\\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. EMPRESA — actualizar datos fiscales
+# ──────────────────────────────────────────────────────────────────────────────
+company = frappe.get_doc("Company", EMPRESA)
+company.update({
+    "default_currency": "PYG",
+    "country":          "Paraguay",
+    "tax_id":           RUC,
+    # Campo custom para SIFEN (se agrega vía Custom Field si no existe)
+})
+company.save(ignore_permissions=True)
+print(f"[OK] Empresa '{EMPRESA}' actualizada — Moneda: PYG, País: Paraguay")
+
+abbr = company.abbr
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. MONEDA
+# ──────────────────────────────────────────────────────────────────────────────
+if not frappe.db.exists("Currency", "PYG"):
+    frappe.get_doc({
+        "doctype":       "Currency",
+        "currency_name": "PYG",
+        "currency_code": "PYG",
+        "fraction":      "Céntimo",
+        "fraction_units": 100,
+        "symbol":        "₲",
+        "number_format": "#.###",    # Miles con punto
+        "smallest_currency_fraction_value": 0.01,
+        "enabled": 1,
+    }).insert(ignore_permissions=True)
+    print("[OK] Moneda PYG (Guaraní) creada")
+else:
+    print("[OK] Moneda PYG ya existe")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. CUENTAS CONTABLES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def create_account(name, parent, atype, is_group=0, account_no=None):
+    """Crea una cuenta si no existe."""
+    full_name = f"{name} - {abbr}"
+    if frappe.db.exists("Account", {"account_name": name, "company": EMPRESA}):
+        return full_name
+    doc = frappe.get_doc({
+        "doctype":        "Account",
+        "account_name":   name,
+        "parent_account": f"{parent} - {abbr}" if not parent.endswith(f"- {abbr}") else parent,
+        "account_type":   atype,
+        "company":        EMPRESA,
+        "is_group":       is_group,
+        "account_number": account_no,
+        "currency":       "PYG",
+    })
+    doc.insert(ignore_permissions=True)
+    return full_name
+
+# Cuentas de activo corriente — Caja y Bancos
+cuentas_caja_banco = [
+    # (nombre, tipo, número de cuenta opcional)
+    ("Caja General",             "Cash",    "1.1.01"),
+    ("Caja Chica Administración","Cash",    "1.1.02"),
+    ("Caja Chica Ventas",        "Cash",    "1.1.03"),
+    ("Banco Continental",        "Bank",    "1.1.10"),
+    ("Banco Itaú Paraguay",      "Bank",    "1.1.11"),
+    ("Banco BBVA Paraguay",      "Bank",    "1.1.12"),
+    ("Banco Familiar",           "Bank",    "1.1.13"),
+    ("Banco BNF",                "Bank",    "1.1.14"),
+]
+for nombre, tipo, num in cuentas_caja_banco:
+    parent = f"Cash - {abbr}" if tipo == "Cash" else f"Bank Accounts - {abbr}"
+    create_account(nombre, parent, tipo, account_no=num)
+    print(f"[OK] Cuenta: {nombre} ({num})")
+
+# Cuentas IVA
+cuentas_iva = [
+    ("IVA Crédito Fiscal 10%",  "Tax",          "1.4.01"),
+    ("IVA Crédito Fiscal 5%",   "Tax",          "1.4.02"),
+    ("IVA Débito Fiscal 10%",   "Tax",          "2.1.10"),
+    ("IVA Débito Fiscal 5%",    "Tax",          "2.1.11"),
+    ("IVA a Pagar",             "Tax",          "2.1.12"),
+]
+for nombre, tipo, num in cuentas_iva:
+    parent_map = {
+        "1.4": f"Current Assets - {abbr}",
+        "2.1": f"Current Liabilities - {abbr}",
+    }
+    prefix = num[:3]
+    parent = parent_map.get(prefix, f"Current Liabilities - {abbr}")
+    create_account(nombre, parent, tipo, account_no=num)
+    print(f"[OK] Cuenta IVA: {nombre} ({num})")
+
+# Impuesto a la Renta
+create_account("IRE por Pagar", f"Current Liabilities - {abbr}", "Tax", account_no="2.1.20")
+create_account("IRP por Pagar", f"Current Liabilities - {abbr}", "Tax", account_no="2.1.21")
+print("[OK] Cuentas IRE/IRP creadas")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. PLANTILLAS DE IMPUESTOS (Sales & Purchase)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def create_tax_template(title, rate, credit_account, debit_account, doctype_prefix="Sales"):
+    """Crea plantilla de impuestos para ventas o compras."""
+    doctype = f"{doctype_prefix} Taxes and Charges Template"
+    if frappe.db.exists(doctype, {"title": title, "company": EMPRESA}):
+        print(f"[OK] Plantilla ya existe: {title}")
+        return
+
+    account = credit_account if doctype_prefix == "Sales" else debit_account
+    account_full = f"{account} - {abbr}"
+
+    frappe.get_doc({
+        "doctype":  doctype,
+        "title":    title,
+        "company":  EMPRESA,
+        "taxes": [{
+            "charge_type":   "On Net Total",
+            "account_head":  account_full,
+            "rate":          rate,
+            "description":   title,
+            "cost_center":   f"Main - {abbr}",
+        }],
+    }).insert(ignore_permissions=True)
+    print(f"[OK] Plantilla {doctype_prefix}: {title} ({rate}%)")
+
+# Ventas — IVA Débito Fiscal
+create_tax_template("IVA Ventas 10%",   10, "IVA Débito Fiscal 10%", "IVA Crédito Fiscal 10%", "Sales")
+create_tax_template("IVA Ventas 5%",    5,  "IVA Débito Fiscal 5%",  "IVA Crédito Fiscal 5%",  "Sales")
+create_tax_template("Exento / Exportación", 0, "IVA Débito Fiscal 10%", "IVA Crédito Fiscal 10%", "Sales")
+
+# Compras — IVA Crédito Fiscal
+create_tax_template("IVA Compras 10%",  10, "IVA Crédito Fiscal 10%", "IVA Crédito Fiscal 10%", "Purchase")
+create_tax_template("IVA Compras 5%",   5,  "IVA Crédito Fiscal 5%",  "IVA Crédito Fiscal 5%",  "Purchase")
+create_tax_template("Exento Compras",   0,  "IVA Crédito Fiscal 10%", "IVA Crédito Fiscal 10%", "Purchase")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. MODOS DE PAGO 
+# ──────────────────────────────────────────────────────────────────────────────
+modos_pago = [
+    # (nombre, tipo, cuenta)
+    ("Efectivo",             "Cash",   "Caja General"),
+    ("Tarjeta de Crédito",  "Bank",   "Banco Continental"),
+    ("Tarjeta de Débito",   "Bank",   "Banco Continental"),
+    ("Transferencia Bancaria","Bank", "Banco Continental"),
+    ("Cheque",              "Bank",   "Banco Continental"),
+    ("QR / Billetera Digital","Bank", "Banco Continental")
+    ] 
+
+for nombre, tipo, cuenta in modos_pago:
+    if not frappe.db.exists("Mode of Payment", nombre):
+        mp = frappe.get_doc({
+            "doctype":         "Mode of Payment",
+            "mode_of_payment": nombre,
+            "type":            tipo,
+            "accounts": [{
+                "company":         EMPRESA,
+                "default_account": f"{cuenta} - {abbr}",
+            }],
+        })
+        mp.insert(ignore_permissions=True)
+        print(f"[OK] Modo de pago: {nombre}")
+    else:
+        # Vincular a esta empresa si ya existe globalmente
+        mp = frappe.get_doc("Mode of Payment", nombre)
+        if not any(a.company == EMPRESA for a in mp.accounts):
+            mp.append("accounts", {
+                "company":         EMPRESA,
+                "default_account": f"{cuenta} - {abbr}",
+            })
+            mp.save(ignore_permissions=True)
+            print(f"[OK] Modo de pago '{nombre}' vinculado a empresa")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. CONDICIONES DE PAGO
+# ──────────────────────────────────────────────────────────────────────────────
+condiciones = [
+    ("Contado",       0),
+    ("15 días",      15),
+    ("30 días",      30),
+    ("60 días",      60),
+    ("90 días",      90),
+    ("120 días",    120),
+]
+for nombre, dias in condiciones:
+    if not frappe.db.exists("Payment Terms Template", nombre):
+        frappe.get_doc({
+            "doctype":       "Payment Terms Template",
+            "template_name": nombre,
+            "terms": [{
+                "due_date_based_on": "Day(s) after invoice date",
+                "credit_days":       dias,
+                "invoice_portion":   100,
+            }],
+        }).insert(ignore_permissions=True)
+        print(f"[OK] Condición de pago: {nombre}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. SERIES DE DOCUMENTOS — formato SIFEN Paraguay
+# ──────────────────────────────────────────────────────────────────────────────
+# Nota: En producción los timbrados deben obtenerse del SIFEN de la SET
+# Aquí se configuran las series internas de ERPNext
+series_map = {
+    "Sales Invoice":     "FACT-PY-.YYYY.-.#####",    # Factura Electrónica
+    "Purchase Invoice":  "COMP-PY-.YYYY.-.#####",    # Comprobante de compra
+    "Sales Order":       "OV-PY-.YYYY.-.#####",      # Orden de venta
+    "Purchase Order":    "OC-PY-.YYYY.-.#####",      # Orden de compra
+    "Payment Entry":     "PAGO-PY-.YYYY.-.#####",    # Recibo / Pago
+    "Journal Entry":     "JE-PY-.YYYY.-.#####",      # Asiento contable
+    "Stock Entry":       "ME-PY-.YYYY.-.#####",      # Movimiento de stock
+    "Delivery Note":     "NR-PY-.YYYY.-.#####",      # Nota de Remisión
+}
+for doctype, prefix in series_map.items():
+    frappe.db.set_value("DocType", doctype, "autoname", prefix)
+    print(f"[OK] Serie: {doctype} → {prefix}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. GRUPOS DE CLIENTES 
+# ──────────────────────────────────────────────────────────────────────────────
+grupos_cliente = [
+    "Contribuyente",       # Empresa con RUC — receptor electrónico
+    "Consumidor Final",    # Persona física sin RUC
+    "Exportador",          # Operaciones de exportación (exentas IVA)
+    "Entidad Pública",     # B2G — entidades del Estado
+    "Diplomático",         # Exoneración fiscal diplomática
+    "Mayorista",
+    "Minorista",
+]
+for g in grupos_cliente:
+    if not frappe.db.exists("Customer Group", g):
+        frappe.get_doc({
+            "doctype":               "Customer Group",
+            "customer_group_name":   g,
+            "parent_customer_group": "All Customer Groups",
+        }).insert(ignore_permissions=True)
+        print(f"[OK] Grupo cliente: {g}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. GRUPOS DE ARTÍCULOS
+# ──────────────────────────────────────────────────────────────────────────────
+grupos_item = [
+    ("Productos Gravados 10%", "All Item Groups"),    # IVA 10%
+    ("Productos Gravados 5%",  "All Item Groups"),    # IVA 5%
+    ("Servicios Gravados 10%", "All Item Groups"),
+    ("Servicios Gravados 5%",  "All Item Groups"),
+    ("Exportaciones",          "All Item Groups"),    # Exento
+    ("Insumos",                "All Item Groups"),
+    ("Activos Fijos",          "All Item Groups"),
+]
+for nombre, parent in grupos_item:
+    if not frappe.db.exists("Item Group", nombre):
+        frappe.get_doc({
+            "doctype":          "Item Group",
+            "item_group_name":  nombre,
+            "parent_item_group": parent,
+        }).insert(ignore_permissions=True)
+        print(f"[OK] Grupo artículo: {nombre}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. ALMACENES
+# ──────────────────────────────────────────────────────────────────────────────
+almacenes = [
+    ("Bodega Principal",      "Transit"),
+    ("Bodega de Tránsito",    "Transit"),    # Para Notas de Remisión
+    ("Mercaderías en Tránsito","Transit"),
+]
+for nombre, tipo in almacenes:
+    if not frappe.db.exists("Warehouse", {"warehouse_name": nombre, "company": EMPRESA}):
+        frappe.get_doc({
+            "doctype":          "Warehouse",
+            "warehouse_name":   nombre,
+            "company":          EMPRESA,
+            "warehouse_type":   tipo,
+        }).insert(ignore_permissions=True)
+        print(f"[OK] Almacén: {nombre}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 11. CUSTOM FIELDS para SIFEN
+# Campos adicionales en Sales Invoice para cumplir con SIFEN
+# ──────────────────────────────────────────────────────────────────────────────
+campos_sifen = [
+    # (dt, fieldname, label, fieldtype, options, insert_after)
+    ("Sales Invoice", "sifen_section",       "SIFEN / Facturación Electrónica",
+     "Section Break",    None,         "remarks"),
+    ("Sales Invoice", "sifen_cdc",           "Código CDC (SIFEN)",
+     "Data",            None,          "sifen_section"),
+    ("Sales Invoice", "sifen_estado",        "Estado SIFEN",
+     "Select",  "Pendiente\nEnviado\nAprobado\nRechazado\nCancelado\nError",
+     "sifen_cdc"),
+    ("Sales Invoice", "sifen_timbrado",      "Número de Timbrado",
+     "Data",            None,          "sifen_estado"),
+    ("Sales Invoice", "sifen_establecimiento","Establecimiento",
+     "Data",            None,          "sifen_timbrado"),
+    ("Sales Invoice", "sifen_punto_exp",     "Punto de Expedición",
+     "Data",            None,          "sifen_establecimiento"),
+    ("Sales Invoice", "sifen_kude_url",      "URL KuDE",
+     "Data",            None,          "sifen_punto_exp"),
+    ("Sales Invoice", "sifen_xml_url",       "XML DTE",
+     "Data",            None,          "sifen_kude_url"),
+    ("Sales Invoice", "sifen_fecha_aprob",   "Fecha Aprobación SET",
+     "Datetime",        None,          "sifen_xml_url"),
+    ("Sales Invoice", "sifen_tipo_iva",      "Tipo de Operación IVA",
+     "Select", "Gravado 10%\nGravado 5%\nExento\nMixto",
+     "sifen_fecha_aprob"),
+    ("Customer",      "ruc",                 "RUC Paraguay",
+     "Data",            None,          "tax_id"),
+    ("Customer",      "tipo_contribuyente",  "Tipo Contribuyente SET",
+     "Select", "Contribuyente RUC\nConsumidor Final\nExtranjero",
+     "ruc"),
+    ("Customer",      "receptor_electronico","Es Receptor Electrónico",
+     "Check",           None,          "tipo_contribuyente"),
+]
+
+for dt, fname, label, ftype, opts, after in campos_sifen:
+    if not frappe.db.exists("Custom Field", {"dt": dt, "fieldname": fname}):
+        cf = {
+            "doctype":      "Custom Field",
+            "dt":           dt,
+            "fieldname":    fname,
+            "label":        label,
+            "fieldtype":    ftype,
+            "insert_after": after,
+        }
+        if opts:   cf["options"] = opts
+        if ftype not in ("Section Break", "Column Break"):
+            cf["read_only"] = 1 if fname.startswith("sifen_") else 0
+        frappe.get_doc(cf).insert(ignore_permissions=True)
+        print(f"[OK] Custom Field: {dt}.{fname}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 12. CONFIGURACIÓN GLOBAL DEL SISTEMA
+# ──────────────────────────────────────────────────────────────────────────────
+frappe.db.set_value("System Settings", None, "country", "Paraguay")
+frappe.db.set_value("System Settings", None, "language", "es")
+frappe.db.set_value("System Settings", None, "time_zone", "America/Asuncion")
+frappe.db.set_value("System Settings", None, "date_format", "dd/mm/yyyy")
+frappe.db.set_value("System Settings", None, "number_format", "#.###,##")  # Formato PY
+print("[OK] Configuración del sistema: Paraguay / Español / America/Asuncion")
+
+frappe.db.commit()
+
+print(f"""
+{'='*60}
+  Configuración completada exitosamente
+
+  Empresa:     {EMPRESA}
+  RUC:         {RUC}
+  Moneda:      PYG (Guaraní ₲)
+  Timezone:    America/Asuncion
+  Formato #:   #.###,## (miles con punto, decimal con coma)
+
+{'='*60}
+""")
+frappe.destroy()
+PYEOF
+
+ok "Configuración completada para '${EMPRESA}'"

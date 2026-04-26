@@ -1,0 +1,543 @@
+"""
+init_company.py — Inicialización de empresa en ERPNext v16
+==========================================================
+Crea o reinicia una empresa con:
+  - Chart of Accounts desde plantilla Paraguay
+  - Cuentas adicionales (Caja, Banco, Billeteras)
+  - Moneda PYG configurada
+  - Modos de pago locales
+  - Tipo de cambio base
+
+Uso desde bench:
+    bench --site erp.chamigo.com.py execute init_company.run \
+        --kwargs '{"company":"Chamigo E.A.S","reset":true}'
+
+Uso standalone (fuera de bench):
+    bench --site erp.chamigo.com.py console
+    >>> import init_company; init_company.run("Chamigo E.A.S", reset=True)
+"""
+
+import frappe
+from frappe.utils import nowdate
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log(msg: str, level: str = "INFO") -> None:
+    prefix = {"INFO": "✔", "WARN": "⚠", "ERROR": "✖"}.get(level, "·")
+    print(f"[{level}] {prefix} {msg}", flush=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de cuenta
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_account(company: str, account_name: str) -> str | None:
+    """Busca cuenta por account_name (sin abreviatura) dentro de una empresa."""
+    return frappe.db.get_value(
+        "Account",
+        {"company": company, "account_name": account_name},
+        "name",
+    )
+
+
+def get_account_by_type(company: str, account_type: str, is_group: int = 0) -> str | None:
+    """Busca la primera cuenta de un tipo dado (útil como fallback)."""
+    return frappe.db.get_value(
+        "Account",
+        {"company": company, "account_type": account_type, "is_group": is_group},
+        "name",
+    )
+
+
+def create_account(
+    company: str,
+    account_name: str,
+    parent_account: str,
+    account_type: str,
+    currency: str = "PYG",
+    is_group: int = 0,
+) -> str | None:
+    """Crea una cuenta si no existe. Retorna el name de la cuenta."""
+    existing = get_account(company, account_name)
+    if existing:
+        log(f"Cuenta ya existe, skip: {account_name}")
+        return existing
+
+    if not parent_account:
+        log(f"Sin parent para {account_name} — skip", "WARN")
+        return None
+
+    doc = frappe.get_doc({
+        "doctype": "Account",
+        "account_name": account_name,
+        "parent_account": parent_account,
+        "company": company,
+        "account_type": account_type,
+        "is_group": is_group,
+        "account_currency": currency,
+    })
+    doc.insert(ignore_permissions=True)
+    log(f"Cuenta creada: {account_name} → {parent_account}")
+    return doc.name
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reset: eliminar cuentas en orden (hijos antes que padres)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_accounts_ordered(company: str) -> list[str]:
+    """
+    Retorna cuentas ordenadas de hoja a raíz (hijos primero).
+    Necesario para poder eliminar sin violar FK de parent_account.
+    """
+    # Traer todas las cuentas con su parent
+    all_accounts = frappe.get_all(
+        "Account",
+        filters={"company": company},
+        fields=["name", "parent_account", "is_group"],
+        order_by="lft desc",  # lft desc = hojas primero en nested set
+    )
+    return [a["name"] for a in all_accounts]
+
+
+def rebuild_coa(company: str) -> None:
+    """Elimina el COA existente y lo recrea desde la plantilla de Paraguay."""
+    log("Eliminando Chart of Accounts existente...")
+
+    # Primero desvincular cuentas de configuración de la empresa
+    # para evitar FK violations al borrar
+    frappe.db.set_value("Company", company, {
+        "default_cash_account":           None,
+        "default_bank_account":           None,
+        "default_receivable_account":     None,
+        "default_payable_account":        None,
+        "default_expense_account":        None,
+        "default_income_account":         None,
+        "round_off_account":              None,
+        "write_off_account":              None,
+        "discount_allowed_account":       None,
+        "discount_received_account":      None,
+        "exchange_gain_loss_account":     None,
+        "unrealized_exchange_gain_loss_account": None,
+        "default_deferred_revenue_account":      None,
+        "default_deferred_expense_account":      None,
+        "accumulated_depreciation_account":      None,
+        "depreciation_expense_account":          None,
+        "capital_work_in_progress_account":      None,
+        "asset_received_but_not_billed":         None,
+        "service_received_but_not_billed":       None,
+        "default_provisional_account":           None,
+        "expense_included_in_asset_valuation":   None,
+        "default_inventory_account":             None,
+        "stock_adjustment_account":              None,
+        "stock_received_but_not_billed":         None,
+        "default_advance_received_account":      None,
+        "default_advance_paid_account":          None,
+    })
+    frappe.db.commit()
+
+    # Desvincular cuentas de los Modos de Pago para esta empresa
+    mop_accounts = frappe.get_all(
+        "Mode of Payment Account",
+        filters={"company": company},
+        pluck="name",
+    )
+    for ma in mop_accounts:
+        frappe.delete_doc("Mode of Payment Account", ma, force=1, ignore_permissions=True)
+    frappe.db.commit()
+
+    # Eliminar cuentas de hoja a raíz
+    ordered = _get_accounts_ordered(company)
+    for acc in ordered:
+        try:
+            # Verificar que no tenga transacciones
+            has_gl = frappe.db.count("GL Entry", {"account": acc})
+            if has_gl:
+                log(f"SKIP (tiene GL Entries): {acc}", "WARN")
+                continue
+            frappe.delete_doc("Account", acc, force=1, ignore_permissions=True)
+        except Exception as e:
+            log(f"Skip {acc}: {e}", "WARN")
+
+    frappe.db.commit()
+    log("COA eliminado")
+
+    # Recrear desde plantilla
+    log("Recreando COA desde plantilla 'Paraguay'...")
+    from erpnext.accounts.doctype.account.chart_of_accounts.chart_of_accounts import create_charts
+    create_charts(company, "Paraguay - Standard")
+    frappe.db.commit()
+    log("COA recreado")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Moneda PYG
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_currency(currency_code: str = "PYG", currency_name: str = "Guaraní Paraguayo") -> None:
+    """Asegura que la moneda exista y esté habilitada."""
+    if not frappe.db.exists("Currency", currency_code):
+        frappe.get_doc({
+            "doctype": "Currency",
+            "currency_name": currency_code,
+            "currency_symbol": "₲",
+            "enabled": 1,
+            "fraction": "Céntimo",
+            "fraction_units": 100,
+            "number_format": "#.###",
+            "smallest_currency_fraction_value": 1,
+        }).insert(ignore_permissions=True)
+        log(f"Moneda creada: {currency_code}")
+    else:
+        frappe.db.set_value("Currency", currency_code, "enabled", 1)
+        log(f"Moneda habilitada: {currency_code}")
+
+    frappe.db.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cuentas adicionales locales
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_group_parent(company: str, account_name: str, account_type: str) -> str | None:
+    """
+    Dado un account_name (ej: "Cash"), devuelve un nombre de cuenta que sea
+    is_group=1 y pueda recibir hijos del tipo dado.
+
+    Estrategia:
+      1. Buscar por account_name con is_group=1
+      2. Si existe pero is_group=0, subir al parent (que debe ser grupo)
+      3. Fallback: buscar cualquier cuenta is_group=1 del tipo dado
+    """
+    # Buscar cuenta por nombre
+    acc = frappe.db.get_value(
+        "Account",
+        {"company": company, "account_name": account_name},
+        ["name", "is_group", "parent_account"],
+        as_dict=True,
+    )
+
+    if acc:
+        if acc.is_group:
+            log(f"Grupo encontrado directo: {acc.name}")
+            return acc.name
+        else:
+            # Es ledger — usar su parent
+            parent = acc.parent_account
+            if parent:
+                log(f"'{account_name}' es ledger — usando parent: {parent}")
+                return parent
+
+    # Fallback: cualquier grupo del tipo
+    fallback = get_account_by_type(company, account_type, is_group=1)
+    if fallback:
+        log(f"Grupo fallback para tipo {account_type}: {fallback}", "WARN")
+        return fallback
+
+    log(f"No se encontró grupo para account_name='{account_name}' type='{account_type}'", "ERROR")
+    return None
+
+
+def ensure_extra_accounts(company: str, abbr: str) -> dict[str, str | None]:
+    """
+    Crea cuentas operativas locales bajo los grupos correctos.
+    Retorna dict con los names de las cuentas creadas.
+    """
+    log("Creando cuentas adicionales...")
+
+    # Resolver grupos padre tolerando que Cash/Bank puedan ser ledger en el COA estándar
+    cash_group = _resolve_group_parent(company, "Cash", "Cash")
+    bank_group = _resolve_group_parent(company, "Bank Accounts", "Bank")
+
+    # Si Bank Accounts no existe, intentar con "Banks" o similar
+    if not bank_group:
+        bank_group = _resolve_group_parent(company, "Banks", "Bank")
+
+    if not cash_group:
+        log("No se encontró grupo padre para cuentas Cash — verifique el COA", "ERROR")
+    if not bank_group:
+        log("No se encontró grupo padre para cuentas Bank — verifique el COA", "ERROR")
+
+    log(f"Parent Cash  : {cash_group}")
+    log(f"Parent Bank  : {bank_group}")
+
+    accounts = {
+        "Caja General":         create_account(company, "Caja General",         cash_group, "Cash", "PYG"),
+        "Banco Principal":      create_account(company, "Banco Principal",       bank_group, "Bank", "PYG"),
+        "Billeteras Digitales": create_account(company, "Billeteras Digitales",  bank_group, "Bank", "PYG"),
+    }
+
+    frappe.db.commit()
+    return accounts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modos de pago
+# ─────────────────────────────────────────────────────────────────────────────
+
+def upsert_mop(name: str, mop_type: str, company: str, account: str | None) -> None:
+    """
+    Crea o actualiza un Modo de Pago con la cuenta de la empresa.
+    Si la cuenta no existe, emite warning y continúa.
+    """
+    if not account:
+        log(f"MOP '{name}' sin cuenta — skip", "WARN")
+        return
+
+    if not frappe.db.exists("Mode of Payment", name):
+        doc = frappe.get_doc({
+            "doctype": "Mode of Payment",
+            "mode_of_payment": name,
+            "type": mop_type,
+            "accounts": [{"company": company, "default_account": account}],
+        })
+        doc.insert(ignore_permissions=True)
+        log(f"MOP creado: {name}")
+        return
+
+    # Ya existe — verificar si tiene la cuenta para esta empresa
+    doc = frappe.get_doc("Mode of Payment", name)
+    company_accounts = [a for a in doc.accounts if a.company == company]
+
+    if not company_accounts:
+        doc.append("accounts", {"company": company, "default_account": account})
+        doc.save(ignore_permissions=True)
+        log(f"MOP actualizado con cuenta de empresa: {name}")
+    else:
+        # Actualizar cuenta si cambió
+        for a in company_accounts:
+            if a.default_account != account:
+                a.default_account = account
+                doc.save(ignore_permissions=True)
+                log(f"MOP cuenta actualizada: {name} -> {account}")
+                break
+        else:
+            log(f"MOP ya configurado, skip: {name}")
+
+
+def setup_payment_methods(company: str, accounts: dict) -> None:
+    """Configura todos los modos de pago locales."""
+    log("Configurando modos de pago...")
+
+    cash_acc  = accounts.get("Caja General")
+    bank_acc  = accounts.get("Banco Principal")
+    qr_acc    = accounts.get("Billeteras Digitales")
+
+    mops = [
+        ("Efectivo",               "Cash", cash_acc),
+        ("Transferencia Bancaria", "Bank", bank_acc),
+        ("Tarjeta de Crédito",     "Bank", bank_acc),
+        ("Tarjeta de Débito",      "Bank", bank_acc),
+        ("Cheque",                 "Bank", bank_acc),
+        ("QR / Billetera Digital", "Bank", qr_acc),
+    ]
+
+    for name, mop_type, account in mops:
+        upsert_mop(name, mop_type, company, account)
+
+    frappe.db.commit()
+    log("Modos de pago configurados")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuración post-COA de la empresa
+# ─────────────────────────────────────────────────────────────────────────────
+
+def configure_company_defaults(company: str, abbr: str) -> None:
+    """Setea las cuentas por defecto de la empresa luego de crear el COA."""
+    log("Configurando defaults de empresa...")
+
+    def ga(name):
+        return get_account(company, name)
+
+    updates = {}
+
+    # Cuentas operativas
+    if ga("Caja General"):
+        updates["default_cash_account"] = ga("Caja General")
+    if ga("Banco Principal"):
+        updates["default_bank_account"] = ga("Banco Principal")
+
+    # Cuentas estándar del COA Paraguay
+    receivable = ga("Debtors") or ga("Cuentas por Cobrar")
+    payable    = ga("Creditors") or ga("Cuentas por Pagar")
+    income     = ga("Sales") or ga("Ventas")
+    expense    = ga("Cost of Goods Sold") or ga("Costo de Ventas")
+
+    if receivable: updates["default_receivable_account"] = receivable
+    if payable:    updates["default_payable_account"]    = payable
+    if income:     updates["default_income_account"]     = income
+    if expense:    updates["default_expense_account"]    = expense
+
+    if updates:
+        frappe.db.set_value("Company", company, updates)
+        frappe.db.commit()
+        log(f"Defaults actualizados: {list(updates.keys())}")
+    else:
+        log("No se encontraron cuentas para defaults — verificar COA", "WARN")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Punto de entrada principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Creación de empresa
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_company(
+    company: str,
+    abbr: str,
+    country: str = "Paraguay",
+    currency: str = "PYG",
+    tax_id: str = "",
+) -> None:
+    """
+    Crea la empresa en ERPNext si no existe.
+    NO pasa chart_of_accounts al insert para evitar el bug de
+    sync_financial_report_templates en ERPNext v16 cuando el template
+    no existe en Financial Report Template.
+    El COA se verifica y crea explícitamente con create_charts() post-insert.
+    """
+    if frappe.db.exists("Company", company):
+        log(f"Empresa ya existe: {company}")
+        return
+
+    log(f"Creando empresa: {company} ({abbr})...")
+
+    doc = frappe.get_doc({
+        "doctype": "Company",
+        "company_name": company,
+        "abbr": abbr,
+        "country": country,
+        "default_currency": currency,
+        "tax_id": tax_id,
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    log(f"Empresa insertada: {company}")
+
+    # Verificar si ERPNext generó el COA automáticamente según el país
+    existing_accounts = frappe.db.count("Account", {"company": company})
+    if existing_accounts == 0:
+        log("COA no generado automaticamente — creando desde plantilla...")
+        from erpnext.accounts.doctype.account.chart_of_accounts.chart_of_accounts import create_charts
+        for template in ["Paraguay - Standard", "Standard"]:
+            try:
+                create_charts(company, template)
+                log(f"COA creado desde plantilla: {template}")
+                frappe.db.commit()
+                break
+            except Exception as e:
+                log(f"Plantilla '{template}' no disponible: {e}", "WARN")
+    else:
+        log(f"COA generado automaticamente: {existing_accounts} cuentas")
+
+    log(f"Empresa lista: {company}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Punto de entrada único
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(
+    company: str,
+    abbr: str | None = None,
+    tax_id: str = "",
+    country: str = "Paraguay",
+    currency: str = "PYG",
+    reset: bool = False,
+) -> None:
+    """
+    Punto de entrada único para creación e inicialización de empresa.
+
+    Flujo interno:
+      1. Si la empresa NO existe → la crea (requiere abbr)
+      2. Si la empresa YA existe y reset=True → reconstruye el COA
+      3. Asegura moneda, cuentas adicionales, defaults y modos de pago
+
+    Args:
+        company : Nombre exacto de la empresa         ej: "Chamigo E.A.S"
+        abbr    : Abreviatura (requerida solo si es    ej: "CHA"
+                  empresa nueva; ignorada si ya existe)
+        tax_id  : RUC / NIT                           ej: "80136183-4"
+        country : País para plantilla COA             ej: "Paraguay"
+        currency: Moneda base                         ej: "PYG"
+        reset   : Reconstruir COA (solo si ya existe) — destructivo
+
+    Uso — empresa nueva:
+        bench --site erp.chamigo.com.py execute frappe.init_company.run \
+            --kwargs '{"company":"Chamigo E.A.S","abbr":"CHA","tax_id":"80136183-4"}'
+
+    Uso — empresa existente, completar faltantes:
+        bench --site erp.chamigo.com.py execute frappe.init_company.run \
+            --kwargs '{"company":"Chamigo E.A.S"}'
+
+    Uso — empresa existente, reconstruir COA completo:
+        bench --site erp.chamigo.com.py execute frappe.init_company.run \
+            --kwargs '{"company":"Chamigo E.A.S","reset":True}'
+    """
+    frappe.set_user("Administrator")
+
+    empresa_existe = frappe.db.exists("Company", company)
+
+    # ── Resolver abreviatura ─────────────────────────────────────────────────
+    if empresa_existe:
+        abbr_real = frappe.db.get_value("Company", company, "abbr")
+    else:
+        if not abbr:
+            raise ValueError(
+                f"La empresa '{company}' no existe y no se proporcionó 'abbr'. "
+                "Incluir abbr para crear la empresa."
+            )
+        abbr_real = abbr
+
+    log("═" * 52)
+    log(f"Empresa  : {company}")
+    log(f"Abrev.   : {abbr_real}")
+    log(f"Tax ID   : {tax_id or '—'}")
+    log(f"País     : {country}")
+    log(f"Moneda   : {currency}")
+    log(f"Existe   : {empresa_existe}")
+    log(f"Reset    : {reset}")
+    log("═" * 52)
+
+    try:
+        # 1. Moneda
+        ensure_currency(currency)
+
+        # 2. Crear empresa si no existe
+        if not empresa_existe:
+            create_company(company, abbr_real, country, currency, tax_id)
+
+        # 3. Reconstruir COA si se solicitó (solo sobre empresa existente)
+        if reset and empresa_existe:
+            gl_count = frappe.db.count("GL Entry", {"company": company})
+            if gl_count > 0:
+                log(f"ADVERTENCIA: {gl_count} GL Entries — algunas cuentas no podrán borrarse", "WARN")
+            rebuild_coa(company)
+
+        # 4. Cuentas adicionales
+        accounts = ensure_extra_accounts(company, abbr_real)
+
+        # 5. Defaults de empresa
+        configure_company_defaults(company, abbr_real)
+
+        # 6. Modos de pago
+        setup_payment_methods(company, accounts)
+
+        frappe.db.commit()
+        log("═" * 52)
+        log("Inicialización completada exitosamente ")
+        log("═" * 52)
+
+    except Exception as e:
+        frappe.db.rollback()
+        log(f"ERROR FATAL: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        raise

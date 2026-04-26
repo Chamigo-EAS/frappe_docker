@@ -1,31 +1,47 @@
+
 services:
-  database:
-    container_name: mariadb-database
-    image: mariadb:11.8
+
+  mariadb:
+    image: mariadb:10.6
+    container_name: mariadb-shared
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
-      start_period: 5s
-      interval: 5s
-      timeout: 5s
-      retries: 5
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --skip-character-set-client-handshake
       - --skip-innodb-read-only-compressed
+      # Tuning para multi-site 
+      - --innodb-buffer-pool-size=512M
+      - --innodb-log-file-size=256M
+      - --max-connections=300
+      - --query-cache-size=0
+      - --query-cache-type=0
+      - --innodb-file-per-table=1
+      - --innodb-flush-log-at-trx-commit=1
+      - --innodb-flush-method=O_DIRECT
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-changeit}
-      MARIADB_AUTO_UPGRADE: 1
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD requerido}
+      MYSQL_DATABASE:      frappe_shared   # DB default
     volumes:
-      - db-data:/var/lib/mysql
+      - mariadb-data:/var/lib/mysql
+      - ./config/mariadb/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+    ports:
+      - "3306:3306"
     networks:
       - mariadb-network
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost",
+             "-u", "root", "-p ${DB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mariadb-data:
+    name: mariadb-shared-data
 
 networks:
   mariadb-network:
     name: mariadb-network
-    external: false
+    external: true
 
-volumes:
-  db-data:

@@ -1,21 +1,31 @@
 services:
-  configurator:
-    environment:
-      REDIS_CACHE: redis-cache:6379
-      REDIS_QUEUE: redis-queue:6379
-    depends_on:
-      - redis-cache
-      - redis-queue
 
   redis-cache:
-    image: redis:6.2-alpine
+    image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
+    volumes:
+      - redis-cache-data:/data
+    networks:
+      - bench-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 3
 
   redis-queue:
-    image: redis:6.2-alpine
+    image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --save "" --appendonly no
     volumes:
       - redis-queue-data:/data
+    networks:
+      - bench-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 3
 
 volumes:
+  redis-cache-data:
   redis-queue-data:

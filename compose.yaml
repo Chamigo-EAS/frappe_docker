@@ -1,9 +1,6 @@
 x-customizable-image: &customizable_image
-  # By default the image used only contains the `frappe` and `erpnext` apps.
-  # See https://github.com/frappe/frappe_docker/blob/main/docs/02-setup/02-build-setup.md#define-custom-apps
-  # about using custom images.
-  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-$ERPNEXT_VERSION}
-  pull_policy: ${PULL_POLICY:-always}
+  image: ${CUSTOM_IMAGE:-frappe/erpnext}:${CUSTOM_TAG:-${ERPNEXT_VERSION}}
+  pull_policy: ${PULL_POLICY:-missing}
   restart: ${RESTART_POLICY:-unless-stopped}
 
 x-depends-on-configurator: &depends_on_configurator
@@ -17,41 +14,79 @@ x-backend-defaults: &backend_defaults
     - sites:/home/frappe/frappe-bench/sites
 
 services:
+
   configurator:
-    <<: *backend_defaults
-    platform: linux/amd64
-    entrypoint:
-      - bash
-      - -c
-    # add redis_socketio for backward compatibility
-    command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
-        bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
-    environment:
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      REDIS_CACHE: ${REDIS_CACHE:-}
-      REDIS_QUEUE: ${REDIS_QUEUE:-}
-      SOCKETIO_PORT: 9000
-    depends_on: {}
+    <<: *customizable_image
+    user: root
     restart: on-failure
+    entrypoint:
+      - python3
+      - -c
+    command:
+      - |
+        import json, os, pathlib, subprocess, sys
+
+        BENCH   = "/home/frappe/frappe-bench"
+        SITES   = BENCH + "/sites"
+        CONFIG  = SITES + "/common_site_config.json"
+        APPS    = BENCH + "/apps"
+
+        # 1. Corregir permisos del volumen
+        print("[configurator] Corrigiendo permisos...", flush=True)
+        subprocess.run(["chown", "-R", "frappe:frappe", SITES], check=True)
+
+        # 2. Listar apps instaladas
+        print("[configurator] Listando apps...", flush=True)
+        apps = sorted(
+            e.name for e in pathlib.Path(APPS).iterdir() if e.is_dir()
+        )
+        pathlib.Path(SITES + "/apps.txt").write_text("\n".join(apps) + "\n")
+        print("  apps:", apps, flush=True)
+
+        # 3. Escribir common_site_config.json
+        print("[configurator] Escribiendo " + CONFIG + "...", flush=True)
+        config_path = pathlib.Path(CONFIG)
+        try:
+            existing = json.loads(config_path.read_text()) if config_path.exists() else {}
+        except Exception:
+            existing = {}
+
+        existing.update({
+            "db_host":        os.environ["DB_HOST"],
+            "db_port":        int(os.environ.get("DB_PORT", 3306)),
+            "redis_cache":    "redis://" + os.environ["REDIS_CACHE"],
+            "redis_queue":    "redis://" + os.environ["REDIS_QUEUE"],
+            "redis_socketio": "redis://" + os.environ["REDIS_QUEUE"],
+            "socketio_port":  9000,
+            "chromium_path":  "/usr/bin/chromium-headless-shell",
+        })
+        config_path.write_text(json.dumps(existing, indent=2))
+        print("[configurator] common_site_config.json OK:", flush=True)
+        print(json.dumps(existing, indent=2), flush=True)
+
+        # 4. Restaurar permisos para usuario frappe
+        print("[configurator] Restaurando permisos frappe...", flush=True)
+        subprocess.run(["chown", "-R", "frappe:frappe", SITES], check=True)
+        print("[configurator] Listo.", flush=True)
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-3306}
+      REDIS_CACHE: ${REDIS_CACHE}
+      REDIS_QUEUE: ${REDIS_QUEUE}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
 
   backend:
     <<: *backend_defaults
-    platform: linux/amd64
 
   frontend:
     <<: *customizable_image
-    platform: linux/amd64
-    command:
-      - nginx-entrypoint.sh
+    command: nginx-entrypoint.sh
     environment:
       BACKEND: backend:8000
       SOCKETIO: websocket:9000
@@ -64,12 +99,13 @@ services:
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     depends_on:
-      - backend
-      - websocket
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
 
   websocket:
     <<: [*depends_on_configurator, *customizable_image]
-    platform: linux/amd64
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
@@ -78,19 +114,39 @@ services:
 
   queue-short:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench worker --queue short,default
 
   queue-long:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench worker --queue long,default,short
 
   scheduler:
     <<: *backend_defaults
-    platform: linux/amd64
     command: bench schedule
 
-# ERPNext requires local assets access (Frappe does not)
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis-queue-data:/data
+
 volumes:
   sites:
+  redis-cache-data:
+  redis-queue-data:
